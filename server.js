@@ -1,6 +1,6 @@
 // ============================================
 // Barangay Culiat — Facebook Messenger Emergency Backend
-// v5 — Matches real schema (emergencies + hotline_calls)
+// v6 — Writes to emergencies + hotline_calls + incident_reports
 // ============================================
 
 const express = require('express');
@@ -55,7 +55,7 @@ app.get('/', (req, res) => {
 });
 
 // ============================================
-// FB VERIFICATION
+// FB WEBHOOK VERIFICATION
 // ============================================
 app.get('/webhook/facebook', (req, res) => {
     const mode = req.query['hub.mode'];
@@ -325,7 +325,7 @@ async function handleLocationReceived(senderId, session, coords) {
 }
 
 // ============================================
-// CREATE + DISPATCH REPORT (uses emergencies + hotline_calls)
+// CREATE + DISPATCH REPORT — WRITES TO ALL 3 TABLES
 // ============================================
 async function createAndDispatchReport(senderId, callerName, fullText, analysis, session, partial) {
     partial = partial || {};
@@ -336,54 +336,119 @@ async function createAndDispatchReport(senderId, callerName, fullText, analysis,
     if (partial.additional_details) fullDescription += `\n\n📝 Detalye: ${partial.additional_details}`;
     fullDescription += `\n\n👤 Reporter: ${callerDisplay}\n📱 Via: Facebook Messenger`;
 
-    // 1. Create emergency record
-    const { data: emergency, error: emErr } = await supabase
-        .from('emergencies')
-        .insert([{
-            type: analysis.type,
-            priority: analysis.priority,
-            status: 'reported',
-            title: `[FB] ${analysis.type.toUpperCase()} — ${finalLocation}`,
-            description: fullDescription,
-            location: { address: finalLocation, source: 'facebook' },
-            reporter_name: callerDisplay,
-            reporter_phone: `FB:${senderId}`,
-            source: 'hotline',
-            verified_status: 'pending',
-            ai_classification: { ...analysis, sender_id: senderId }
-        }])
-        .select()
-        .single();
+    console.log(`📝 Creating records for: ${analysis.type}/${analysis.priority} at ${finalLocation}`);
 
-    if (emErr) console.error('Emergency insert error:', emErr);
+    // ============================================
+    // 1. Create EMERGENCY record (main incident table)
+    // ============================================
+    let emergencyId = null;
+    try {
+        const { data: emergency, error: emErr } = await supabase
+            .from('emergencies')
+            .insert([{
+                type: analysis.type,
+                priority: analysis.priority,
+                status: 'reported',
+                title: `[FB] ${analysis.type.toUpperCase()} — ${finalLocation}`,
+                description: fullDescription,
+                location: { address: finalLocation, source: 'facebook' },
+                reporter_name: callerDisplay,
+                reporter_phone: `FB:${senderId}`,
+                source: 'hotline',
+                verified_status: 'pending',
+                ai_classification: { ...analysis, sender_id: senderId }
+            }])
+            .select()
+            .single();
 
-    // 2. Create hotline_calls record (links to emergency)
-    const { data: hotline, error: hlErr } = await supabase
-        .from('hotline_calls')
-        .insert([{
-            caller_number: `FB:${senderId}`,
-            caller_name: callerDisplay,
-            description: fullDescription,
-            emergency_type: analysis.type,
-            priority: analysis.priority,
-            status: 'pending',
-            call_type: 'facebook',
-            incident_location: finalLocation,
-            duration: 0,
-            emergency_id: emergency?.id
-        }])
-        .select()
-        .single();
+        if (emErr) {
+            console.error('❌ Emergency insert error:', JSON.stringify(emErr, null, 2));
+        } else {
+            emergencyId = emergency.id;
+            console.log(`✅ Emergency created: ${emergencyId}`);
+        }
+    } catch (err) {
+        console.error('❌ Emergency insert exception:', err.message);
+    }
 
-    if (hlErr) console.error('Hotline insert error:', hlErr);
+    // ============================================
+    // 2. Create HOTLINE_CALL record (hotline module)
+    // ============================================
+    let hotlineId = null;
+    try {
+        const { data: hotline, error: hlErr } = await supabase
+            .from('hotline_calls')
+            .insert([{
+                caller_number: `FB:${senderId}`,
+                caller_name: callerDisplay,
+                description: fullDescription,
+                emergency_type: analysis.type,
+                priority: analysis.priority,
+                status: 'pending',
+                call_type: 'facebook',
+                incident_location: finalLocation,
+                duration: 0,
+                emergency_id: emergencyId
+            }])
+            .select()
+            .single();
 
-    // 3. Reset session
+        if (hlErr) {
+            console.error('❌ Hotline insert error:', JSON.stringify(hlErr, null, 2));
+        } else {
+            hotlineId = hotline.id;
+            console.log(`✅ Hotline call created: ${hotlineId}`);
+        }
+    } catch (err) {
+        console.error('❌ Hotline insert exception:', err.message);
+    }
+
+    // ============================================
+    // 3. ALSO create INCIDENT_REPORTS record
+    //    (so existing responder dashboard shows it)
+    // ============================================
+    try {
+        const { data: incident, error: incErr } = await supabase
+            .from('incident_reports')
+            .insert([{
+                type: analysis.type,
+                title: `[FB] ${analysis.type.toUpperCase()} — ${finalLocation}`,
+                description: fullDescription,
+                location: JSON.stringify({ address: finalLocation }),
+                contact_number: `FB:${senderId}`,
+                priority: analysis.priority,
+                status: 'reported',
+                barangay: 'Culiat',
+                ai_analysis: {
+                    ...analysis,
+                    source: 'facebook_messenger',
+                    sender_id: senderId,
+                    caller_name: callerDisplay
+                }
+            }])
+            .select()
+            .single();
+
+        if (incErr) {
+            console.error('❌ Incident insert error:', JSON.stringify(incErr, null, 2));
+        } else {
+            console.log(`✅ Incident created: ${incident.id}`);
+        }
+    } catch (err) {
+        console.error('❌ Incident insert exception:', err.message);
+    }
+
+    // ============================================
+    // 4. Reset session
+    // ============================================
     await supabase.from('facebook_sessions').update({
         state: 'idle',
         partial_data: {}
     }).eq('fb_sender_id', senderId);
 
-    // 4. Reply to user
+    // ============================================
+    // 5. Reply to user
+    // ============================================
     const emoji = { critical: '🚨', high: '🟠', medium: '🟡', low: '🔵' }[analysis.priority] || '📋';
     const firstName = callerDisplay.split(' ')[0];
     const reply = `${emoji} **Natanggap na ang report mo, ${firstName}!**
@@ -397,7 +462,7 @@ Naipadala na sa aming responders. Manatiling kalmado at ligtas.
 Para sa life-threatening emergency, tumawag din sa **911**.`;
 
     await sendFBMessage(senderId, reply);
-    console.log(`✅ Report: emergency=${emergency?.id}, hotline=${hotline?.id}`);
+    console.log(`✅ All records created. Emergency=${emergencyId}, Hotline=${hotlineId}`);
 }
 
 // ============================================
