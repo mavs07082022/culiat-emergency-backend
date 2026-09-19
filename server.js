@@ -1,6 +1,6 @@
 // ============================================
 // Barangay Culiat — Facebook Messenger Emergency Backend
-// Receives FB messages → AI parse → save to Supabase → reply
+// v2 — Gemini 3.6 + Location Fix
 // ============================================
 
 const express = require('express');
@@ -14,7 +14,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: false, limit: '10mb' }));
 
 // ============================================
-// CONFIG (from environment variables)
+// CONFIG
 // ============================================
 const CONFIG = {
     SUPABASE_URL: process.env.SUPABASE_URL,
@@ -23,16 +23,15 @@ const CONFIG = {
     FB_PAGE_ACCESS_TOKEN: process.env.FB_PAGE_ACCESS_TOKEN,
     FB_VERIFY_TOKEN: process.env.FB_VERIFY_TOKEN || 'culiat_ecs_verify_2026',
     FB_APP_SECRET: process.env.FB_APP_SECRET,
+    GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-3.6-flash',
 };
 
-// Validate config on startup
+// Validate config
 const missing = Object.keys(CONFIG).filter(k => !CONFIG[k]);
 if (missing.length > 0) {
     console.error('❌ Missing environment variables:', missing.join(', '));
-    console.error('Set them in Railway → Variables tab');
 }
 
-// Initialize clients
 const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_SERVICE_KEY);
 const genAI = new GoogleGenerativeAI(CONFIG.GEMINI_API_KEY);
 
@@ -59,6 +58,7 @@ app.get('/', (req, res) => {
                 <li>Gemini: ${CONFIG.GEMINI_API_KEY ? '✅' : '❌'}</li>
                 <li>FB Token: ${CONFIG.FB_PAGE_ACCESS_TOKEN ? '✅' : '❌'}</li>
                 <li>FB Secret: ${CONFIG.FB_APP_SECRET ? '✅' : '❌'}</li>
+                <li>Gemini Model: <code>${CONFIG.GEMINI_MODEL}</code></li>
             </ul>
         </body>
         </html>
@@ -67,7 +67,6 @@ app.get('/', (req, res) => {
 
 // ============================================
 // FACEBOOK WEBHOOK — Verification (GET)
-// Facebook calls this once when you set up the webhook
 // ============================================
 app.get('/webhook/facebook', (req, res) => {
     const mode = req.query['hub.mode'];
@@ -88,17 +87,14 @@ app.get('/webhook/facebook', (req, res) => {
 // FACEBOOK WEBHOOK — Message Events (POST)
 // ============================================
 app.post('/webhook/facebook', async (req, res) => {
-    // Verify signature
     const signature = req.headers['x-hub-signature-256'];
     if (CONFIG.FB_APP_SECRET && !verifyFBSignature(req.body, signature)) {
         console.warn('⚠️ Invalid FB signature — rejecting');
         return res.sendStatus(403);
     }
 
-    // Respond immediately (FB needs < 15s)
     res.status(200).send('EVENT_RECEIVED');
 
-    // Process async
     try {
         const body = req.body;
         if (body.object !== 'page') return;
@@ -139,7 +135,6 @@ async function handleFBMessage(event) {
     const pageId = event.recipient?.id;
     if (!senderId || !pageId) return;
 
-    // Postback (button click)
     if (event.postback) {
         return handlePostback(senderId, event.postback);
     }
@@ -152,7 +147,6 @@ async function handleFBMessage(event) {
 
     console.log(`💬 FB Message from ${senderId}: "${text}" (${attachments.length} attachments)`);
 
-    // Save raw message
     const { data: savedMsg } = await supabase
         .from('facebook_messages')
         .insert([{
@@ -167,10 +161,8 @@ async function handleFBMessage(event) {
         .select()
         .single();
 
-    // Get sender name
     const senderName = await getFBSenderName(senderId);
 
-    // Get or create session
     let { data: session } = await supabase
         .from('facebook_sessions')
         .select('*')
@@ -191,18 +183,16 @@ async function handleFBMessage(event) {
         session = newSession;
     }
 
-    // Handle location attachment
     const locationAttach = attachments.find(a => a.type === 'location');
     if (locationAttach?.payload?.coordinates) {
         return handleLocationReceived(senderId, session, locationAttach.payload.coordinates, savedMsg);
     }
 
-    // Route by session state
     await routeMessage(senderId, senderName, session, text, attachments, savedMsg);
 }
 
 // ============================================
-// GET FB SENDER NAME (cached)
+// GET FB SENDER NAME (cached, silent fail)
 // ============================================
 const senderNameCache = new Map();
 async function getFBSenderName(senderId) {
@@ -210,13 +200,20 @@ async function getFBSenderName(senderId) {
     try {
         const res = await axios.get(
             `https://graph.facebook.com/v18.0/${senderId}`,
-            { params: { access_token: CONFIG.FB_PAGE_ACCESS_TOKEN, fields: 'first_name,last_name' } }
+            {
+                params: {
+                    access_token: CONFIG.FB_PAGE_ACCESS_TOKEN,
+                    fields: 'first_name,last_name'
+                },
+                timeout: 5000
+            }
         );
         const name = `${res.data.first_name || ''} ${res.data.last_name || ''}`.trim() || 'Resident';
         senderNameCache.set(senderId, name);
         return name;
     } catch (err) {
-        console.warn('Could not fetch FB name:', err.message);
+        // Silent fail — non-critical. Default to "Resident"
+        senderNameCache.set(senderId, 'Resident');
         return 'Resident';
     }
 }
@@ -227,7 +224,6 @@ async function getFBSenderName(senderId) {
 async function routeMessage(senderId, senderName, session, text, attachments, savedMsg) {
     const lower = text.toLowerCase().trim();
 
-    // Global commands
     if (['help', 'tulong', 'menu', 'start'].includes(lower)) {
         return sendFBHelp(senderId, senderName);
     }
@@ -235,7 +231,6 @@ async function routeMessage(senderId, senderName, session, text, attachments, sa
         return sendFBStatus(senderId);
     }
 
-    // Idle state
     if (session.state === 'idle') {
         if (['hi', 'hello', 'hey', 'kumusta', 'kamusta'].includes(lower)) {
             return sendFBWelcome(senderId, senderName);
@@ -248,12 +243,10 @@ async function routeMessage(senderId, senderName, session, text, attachments, sa
             return sendFBCouldNotUnderstand(senderId);
         }
 
-        // Critical + has location → auto-dispatch
         if (analysis.priority === 'critical' && analysis.location && analysis.location !== 'Unknown') {
             return createAndDispatchReport(senderId, senderName, text, analysis, session, savedMsg);
         }
 
-        // Ask for location
         await supabase.from('facebook_sessions').update({
             state: 'awaiting_location',
             partial_data: {
@@ -266,7 +259,6 @@ async function routeMessage(senderId, senderName, session, text, attachments, sa
         return sendFBAwaitingLocation(senderId, analysis);
     }
 
-    // Awaiting location
     if (session.state === 'awaiting_location') {
         const partial = session.partial_data || {};
         partial.location_text = text;
@@ -279,24 +271,36 @@ async function routeMessage(senderId, senderName, session, text, attachments, sa
 }
 
 // ============================================
-// AI ANALYSIS
+// AI ANALYSIS — Gemini with model fallback
 // ============================================
 async function analyzeReport(messageText, attachments = []) {
-    try {
-        const model = genAI.getGenerativeModel({
-            model: 'gemini-2.0-flash',
-            generationConfig: {
-                temperature: 0.1,
-                responseMimeType: 'application/json'
-            }
-        });
+    // Try configured model first, then fall back to alternatives
+    const modelsToTry = [
+        CONFIG.GEMINI_MODEL,
+        'gemini-3.6-flash',
+        'gemini-2.5-flash',
+        'gemini-1.5-flash',
+        'gemini-pro'
+    ].filter(Boolean);
 
-        const hasMedia = attachments.length > 0;
-        const mediaInfo = hasMedia
-            ? `The message includes ${attachments.length} attachment(s): ${attachments.map(a => a.type).join(', ')}.`
-            : '';
+    let lastError = null;
 
-        const prompt = `You are an emergency dispatcher for Barangay Culiat, Quezon City, Philippines.
+    for (const modelName of modelsToTry) {
+        try {
+            const model = genAI.getGenerativeModel({
+                model: modelName,
+                generationConfig: {
+                    temperature: 0.1,
+                    responseMimeType: 'application/json'
+                }
+            });
+
+            const hasMedia = attachments.length > 0;
+            const mediaInfo = hasMedia
+                ? `The message includes ${attachments.length} attachment(s): ${attachments.map(a => a.type).join(', ')}.`
+                : '';
+
+            const prompt = `You are an emergency dispatcher for Barangay Culiat, Quezon City, Philippines.
 
 A resident sent this via Facebook Messenger: "${messageText}"
 ${mediaInfo}
@@ -331,34 +335,77 @@ Return ONLY this JSON (no markdown):
   "suggestedReply": "Natanggap namin ang ulat ng sunog. Padating na ang responders."
 }`;
 
-        const result = await model.generateContent(prompt);
-        let text = result.response.text().trim();
-        text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-        const parsed = JSON.parse(text);
+            const result = await model.generateContent(prompt);
+            let text = result.response.text().trim();
+            text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+            const parsed = JSON.parse(text);
 
-        const validTypes = ['fire', 'medical', 'accident', 'flood', 'crime', 'other'];
-        const validPriorities = ['critical', 'high', 'medium', 'low'];
+            const validTypes = ['fire', 'medical', 'accident', 'flood', 'crime', 'other'];
+            const validPriorities = ['critical', 'high', 'medium', 'low'];
 
-        return {
-            type: validTypes.includes(parsed.type) ? parsed.type : 'other',
-            priority: validPriorities.includes(parsed.priority) ? parsed.priority : 'medium',
-            location: parsed.location || 'Unknown',
-            confidence: Math.min(0.99, Math.max(0.0, parseFloat(parsed.confidence) || 0.5)),
-            isNonsense: !!parsed.isNonsense,
-            suggestedReply: parsed.suggestedReply || 'Natanggap namin ang inyong ulat.'
-        };
-    } catch (err) {
-        console.error('AI analysis error:', err.message);
-        return {
-            type: 'other',
-            priority: 'medium',
-            location: 'Unknown',
-            confidence: 0.5,
-            isNonsense: false,
-            suggestedReply: 'Natanggap namin ang inyong mensahe. Ive-verify ng aming operator.',
-            error: err.message
-        };
+            console.log(`✅ AI analyzed with ${modelName}`);
+
+            return {
+                type: validTypes.includes(parsed.type) ? parsed.type : 'other',
+                priority: validPriorities.includes(parsed.priority) ? parsed.priority : 'medium',
+                location: parsed.location || 'Unknown',
+                confidence: Math.min(0.99, Math.max(0.0, parseFloat(parsed.confidence) || 0.5)),
+                isNonsense: !!parsed.isNonsense,
+                suggestedReply: parsed.suggestedReply || 'Natanggap namin ang inyong ulat.',
+                model: modelName
+            };
+        } catch (err) {
+            lastError = err;
+            console.warn(`⚠️ Model ${modelName} failed: ${err.message}`);
+            continue;
+        }
     }
+
+    // All models failed — use rule-based fallback
+    console.error('❌ All Gemini models failed, using rule-based fallback');
+    return ruleBasedAnalysis(messageText, lastError);
+}
+
+// ============================================
+// RULE-BASED FALLBACK (when Gemini is down)
+// ============================================
+function ruleBasedAnalysis(text, error) {
+    const lower = (text || '').toLowerCase();
+
+    const keywords = {
+        fire: ['sunog', 'apoy', 'fire', 'nasusunog', 'usok', 'nagniningas'],
+        medical: ['sugat', 'sakit', 'ospital', 'hindi humihinga', 'atake', 'medical', 'ambulance', 'dugo', 'nahihilo'],
+        accident: ['aksidente', 'bangga', 'nasagasaan', 'accident', 'crash', 'nahulog'],
+        flood: ['baha', 'pagbaha', 'flood', 'tubig', 'lunod'],
+        crime: ['holdap', 'nakaw', 'saksak', 'baril', 'away', 'crime', 'robbery', 'theft']
+    };
+
+    const criticalWords = ['patay', 'walang malay', 'hindi humihinga', 'explosion', 'sumabog', 'baril', 'saksak'];
+
+    let detectedType = 'other';
+    let matchCount = 0;
+
+    for (const [type, words] of Object.entries(keywords)) {
+        const matches = words.filter(w => lower.includes(w)).length;
+        if (matches > matchCount) {
+            matchCount = matches;
+            detectedType = type;
+        }
+    }
+
+    const isCritical = criticalWords.some(w => lower.includes(w));
+    const priority = isCritical ? 'critical' : (matchCount > 0 ? 'medium' : 'low');
+
+    return {
+        type: detectedType,
+        priority: priority,
+        location: 'Unknown',
+        confidence: 0.6,
+        isNonsense: false,
+        suggestedReply: 'Natanggap namin ang inyong ulat. Ive-verify ng aming operator.',
+        source: 'rule-based',
+        error: error?.message
+    };
 }
 
 // ============================================
@@ -496,23 +543,24 @@ async function createAndDispatchReport(senderId, senderName, fullText, analysis,
 // ============================================
 // FACEBOOK SEND HELPERS
 // ============================================
-async function sendFBMessage(recipientId, text, quickReplies = null) {
+async function sendFBMessage(recipientId, text) {
     try {
-        const payload = {
-            recipient: { id: recipientId },
-            message: { text: text }
-        };
-        if (quickReplies) {
-            payload.message.quick_replies = quickReplies;
-        }
         await axios.post(
             `https://graph.facebook.com/v18.0/me/messages`,
-            payload,
-            { params: { access_token: CONFIG.FB_PAGE_ACCESS_TOKEN } }
+            {
+                recipient: { id: recipientId },
+                messaging_type: 'RESPONSE',
+                message: { text: text }
+            },
+            {
+                params: { access_token: CONFIG.FB_PAGE_ACCESS_TOKEN },
+                timeout: 10000
+            }
         );
         console.log(`✉️ FB reply sent to ${recipientId}`);
     } catch (err) {
-        console.error('FB send failed:', err.response?.data || err.message);
+        const errData = err.response?.data || err.message;
+        console.error('FB send failed:', JSON.stringify(errData, null, 2));
     }
 }
 
@@ -525,7 +573,7 @@ Para mag-report ng emergency, i-type lang kung ano ang nangyari. Halimbawa:
 • "baha dito sa kanto namin"
 • "may holdap sa 7-eleven"
 
-Pwede rin magpadala ng litrato, video, o location. 🚨
+Pwede rin magpadala ng litrato, video, o location.
 
 Type HELP para sa menu.`;
 
@@ -565,6 +613,7 @@ async function sendFBAwaitingLocation(senderId, analysis) {
         flood: '🌊', crime: '🚨', other: '⚠️'
     }[analysis.type] || '⚠️';
 
+    // NOTE: Quick replies with location removed — deprecated by FB API v4+
     await sendFBMessage(
         senderId,
         `${emoji} Natanggap ko ang ulat mo na ${analysis.type}.
@@ -572,8 +621,7 @@ async function sendFBAwaitingLocation(senderId, analysis) {
 📍 SAAN ito nangyari?
 Pakisagot ang lokasyon (street, landmark, o building).
 
-O kaya i-tap ang 📎 at i-share ang live location.`,
-        [{ content_type: 'location' }]
+Pwede mo ring i-tap ang 📎 (attachment icon) sa Messenger at i-share ang LIVE LOCATION para mas mabilis ang response.`
     );
 }
 
@@ -625,6 +673,7 @@ app.listen(PORT, () => {
     console.log('Config status:');
     console.log('  Supabase:', CONFIG.SUPABASE_URL ? '✅' : '❌');
     console.log('  Gemini:', CONFIG.GEMINI_API_KEY ? '✅' : '❌');
+    console.log('  Gemini Model:', CONFIG.GEMINI_MODEL);
     console.log('  FB Token:', CONFIG.FB_PAGE_ACCESS_TOKEN ? '✅' : '❌');
     console.log('  FB Secret:', CONFIG.FB_APP_SECRET ? '✅' : '❌');
     console.log('========================================');
