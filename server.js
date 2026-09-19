@@ -1,6 +1,6 @@
 // ============================================
 // Barangay Culiat — Facebook Messenger Emergency Backend
-// v7 — Type mapping for emergencies table + triple-write
+// v7 — Geocoding + writes to emergencies + hotline_calls + incident_reports
 // ============================================
 
 const express = require('express');
@@ -31,12 +31,12 @@ const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_SERVICE_KEY);
 const genAI = new GoogleGenerativeAI(CONFIG.GEMINI_API_KEY);
 
 // ============================================
-// TYPE MAPPING — bot types → emergencies schema types
+// TYPE MAPPING
 // ============================================
 const EMERGENCY_TYPE_MAP = {
     'fire': 'fire',
     'flood': 'flood',
-    'crime': 'armed_conflict',           // bot says "crime" → schema says "armed_conflict"
+    'crime': 'armed_conflict',
     'medical': 'medical',
     'accident': 'accident',
     'other': 'other',
@@ -46,6 +46,85 @@ const EMERGENCY_TYPE_MAP = {
 
 function mapEmergencyType(botType) {
     return EMERGENCY_TYPE_MAP[botType] || 'other';
+}
+
+// ============================================
+// GEOCODING — Location string → lat/lng
+// ============================================
+const BARANGAY_BOUNDS = {
+    north: 14.7000,
+    south: 14.6400,
+    east: 121.0400,
+    west: 120.9700,
+    centerLat: 14.6760,
+    centerLng: 121.0150
+};
+
+const geocodeCache = new Map();
+
+async function geocodeLocation(locationString) {
+    if (!locationString || typeof locationString !== 'string') return null;
+    const address = locationString.trim();
+    if (address.length < 3) return null;
+
+    // Cache check
+    if (geocodeCache.has(address)) {
+        return geocodeCache.get(address);
+    }
+
+    // If it's already coordinates like "14.6760, 121.0150"
+    const coordMatch = address.match(/^(-?\d+\.\d+)[,\s]+(-?\d+\.\d+)$/);
+    if (coordMatch) {
+        const result = { lat: parseFloat(coordMatch[1]), lng: parseFloat(coordMatch[2]) };
+        geocodeCache.set(address, result);
+        return result;
+    }
+
+    try {
+        const viewbox = `${BARANGAY_BOUNDS.west},${BARANGAY_BOUNDS.north},${BARANGAY_BOUNDS.east},${BARANGAY_BOUNDS.south}`;
+        const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1&countrycodes=ph&viewbox=${viewbox}&bounded=1`;
+
+        const res = await axios.get(url, {
+            headers: { 'User-Agent': 'BarangayCuliatECS/1.0', 'Accept': 'application/json' },
+            timeout: 8000
+        });
+
+        if (res.data && res.data.length > 0) {
+            const result = {
+                lat: parseFloat(res.data[0].lat),
+                lng: parseFloat(res.data[0].lon)
+            };
+            geocodeCache.set(address, result);
+            return result;
+        }
+
+        // Fallback without bounding
+        const fallbackUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address + ', Quezon City')}&format=json&limit=1&countrycodes=ph`;
+        const fallbackRes = await axios.get(fallbackUrl, {
+            headers: { 'User-Agent': 'BarangayCuliatECS/1.0', 'Accept': 'application/json' },
+            timeout: 8000
+        });
+
+        if (fallbackRes.data && fallbackRes.data.length > 0) {
+            const result = {
+                lat: parseFloat(fallbackRes.data[0].lat),
+                lng: parseFloat(fallbackRes.data[0].lon)
+            };
+            geocodeCache.set(address, result);
+            return result;
+        }
+    } catch (err) {
+        console.warn('Geocode request failed:', err.message);
+    }
+
+    // Fallback: barangay center
+    const fallback = {
+        lat: BARANGAY_BOUNDS.centerLat,
+        lng: BARANGAY_BOUNDS.centerLng,
+        approximate: true
+    };
+    geocodeCache.set(address, fallback);
+    return fallback;
 }
 
 // ============================================
@@ -338,12 +417,12 @@ async function handleLocationReceived(senderId, session, coords) {
         originalText,
         analysis,
         session,
-        { ...partial, location_text: analysis.location }
+        { ...partial, location_text: analysis.location, explicitCoords: { lat: coords.lat, lng: coords.long } }
     );
 }
 
 // ============================================
-// CREATE + DISPATCH REPORT — WRITES TO ALL 3 TABLES
+// CREATE + DISPATCH REPORT
 // ============================================
 async function createAndDispatchReport(senderId, callerName, fullText, analysis, session, partial) {
     partial = partial || {};
@@ -357,20 +436,38 @@ async function createAndDispatchReport(senderId, callerName, fullText, analysis,
 
     console.log(`📝 Creating records: botType=${analysis.type} → schemaType=${emergencyTypeForSchema} | priority=${analysis.priority} | location=${finalLocation}`);
 
+    // ---- Geocode the location (skip if we already have explicit coordinates) ----
+    let coords = partial.explicitCoords || null;
+    if (!coords) {
+        try {
+            coords = await geocodeLocation(finalLocation);
+            if (coords) {
+                console.log(`📍 Geocoded "${finalLocation}" → ${coords.lat}, ${coords.lng}${coords.approximate ? ' (approximate)' : ''}`);
+            }
+        } catch (e) {
+            console.warn('Geocoding failed:', e.message);
+        }
+    }
+
+    // Build location object WITH lat/lng (so the database columns auto-populate)
+    const locationObj = coords
+        ? { address: finalLocation, latitude: coords.lat, longitude: coords.lng, source: 'facebook' }
+        : { address: finalLocation, source: 'facebook' };
+
     // ============================================
-    // 1. Create EMERGENCY record (uses mapped type)
+    // 1. Create EMERGENCY record
     // ============================================
     let emergencyId = null;
     try {
         const { data: emergency, error: emErr } = await supabase
             .from('emergencies')
             .insert([{
-                type: emergencyTypeForSchema,       // ← MAPPED TYPE
+                type: emergencyTypeForSchema,
                 priority: analysis.priority,
                 status: 'reported',
                 title: `[FB] ${analysis.type.toUpperCase()} — ${finalLocation}`,
                 description: fullDescription,
-                location: { address: finalLocation, source: 'facebook' },
+                location: locationObj,
                 reporter_name: callerDisplay,
                 reporter_phone: `FB:${senderId}`,
                 source: 'hotline',
@@ -378,7 +475,9 @@ async function createAndDispatchReport(senderId, callerName, fullText, analysis,
                 ai_classification: {
                     ...analysis,
                     sender_id: senderId,
-                    original_bot_type: analysis.type
+                    original_bot_type: analysis.type,
+                    geocoded: !!coords,
+                    approximate: coords?.approximate || false
                 }
             }])
             .select()
@@ -405,7 +504,7 @@ async function createAndDispatchReport(senderId, callerName, fullText, analysis,
                 caller_number: `FB:${senderId}`,
                 caller_name: callerDisplay,
                 description: fullDescription,
-                emergency_type: analysis.type,       // ← original bot type (hotline_calls has no strict check)
+                emergency_type: analysis.type,
                 priority: analysis.priority,
                 status: 'pending',
                 call_type: 'facebook',
@@ -427,16 +526,16 @@ async function createAndDispatchReport(senderId, callerName, fullText, analysis,
     }
 
     // ============================================
-    // 3. Create INCIDENT_REPORTS record (responder dashboard)
+    // 3. Create INCIDENT_REPORTS record
     // ============================================
     try {
         const { data: incident, error: incErr } = await supabase
             .from('incident_reports')
             .insert([{
-                type: analysis.type,             // ← incident_reports accepts 'crime'
+                type: analysis.type,
                 title: `[FB] ${analysis.type.toUpperCase()} — ${finalLocation}`,
                 description: fullDescription,
-                location: JSON.stringify({ address: finalLocation }),
+                location: JSON.stringify(locationObj),
                 contact_number: `FB:${senderId}`,
                 priority: analysis.priority,
                 status: 'reported',
@@ -445,7 +544,8 @@ async function createAndDispatchReport(senderId, callerName, fullText, analysis,
                     ...analysis,
                     source: 'facebook_messenger',
                     sender_id: senderId,
-                    caller_name: callerDisplay
+                    caller_name: callerDisplay,
+                    geocoded: !!coords
                 }
             }])
             .select()
@@ -469,7 +569,7 @@ async function createAndDispatchReport(senderId, callerName, fullText, analysis,
     }).eq('fb_sender_id', senderId);
 
     // ============================================
-    // 5. Reply to user
+    // 5. Reply
     // ============================================
     const emoji = { critical: '🚨', high: '🟠', medium: '🟡', low: '🔵' }[analysis.priority] || '📋';
     const firstName = callerDisplay.split(' ')[0];
@@ -484,7 +584,7 @@ Naipadala na sa aming responders. Manatiling kalmado at ligtas.
 Para sa life-threatening emergency, tumawag din sa **911**.`;
 
     await sendFBMessage(senderId, reply);
-    console.log(`✅ All records created. Emergency=${emergencyId}, Hotline=${hotlineId}`);
+    console.log(`✅ All records created. Emergency=${emergencyId}, Hotline=${hotlineId}, Coords=${coords ? 'yes' : 'no'}`);
 }
 
 // ============================================
