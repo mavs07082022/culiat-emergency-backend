@@ -1,6 +1,6 @@
 // ============================================
 // Barangay Culiat — Facebook Messenger Emergency Backend
-// v3 — Raw Body Signature Fix + Gemini 3.6
+// v4 — Name-Collection Flow + Raw Body Signature Fix
 // ============================================
 
 const express = require('express');
@@ -17,8 +17,6 @@ const app = express();
 app.use(express.json({
     limit: '10mb',
     verify: (req, res, buf) => {
-        // Save the raw buffer BEFORE JSON parsing
-        // This is what Facebook actually signs
         req.rawBody = buf;
     }
 }));
@@ -99,7 +97,6 @@ app.get('/webhook/facebook', (req, res) => {
 // FACEBOOK WEBHOOK — Message Events (POST)
 // ============================================
 app.post('/webhook/facebook', async (req, res) => {
-    // Signature verification using RAW body
     if (!CONFIG.BYPASS_SIGNATURE && CONFIG.FB_APP_SECRET) {
         if (!verifyFBSignature(req)) {
             console.warn('⚠️ Invalid FB signature — rejecting');
@@ -125,23 +122,14 @@ app.post('/webhook/facebook', async (req, res) => {
     }
 });
 
-// ============================================
-// VERIFY SIGNATURE — Uses RAW body bytes
-// ============================================
 function verifyFBSignature(req) {
     const signature = req.headers['x-hub-signature-256'];
-    if (!signature) {
-        console.warn('⚠️ No x-hub-signature-256 header');
-        return false;
-    }
-    if (!req.rawBody) {
-        console.warn('⚠️ No raw body captured');
-        return false;
-    }
+    if (!signature) return false;
+    if (!req.rawBody) return false;
 
     const expected = 'sha256=' + crypto
         .createHmac('sha256', CONFIG.FB_APP_SECRET)
-        .update(req.rawBody)   // ← USE RAW BUFFER
+        .update(req.rawBody)
         .digest('hex');
 
     try {
@@ -149,8 +137,7 @@ function verifyFBSignature(req) {
             Buffer.from(signature),
             Buffer.from(expected)
         );
-    } catch (err) {
-        console.warn('Signature comparison error:', err.message);
+    } catch {
         return false;
     }
 }
@@ -220,7 +207,7 @@ async function handleFBMessage(event) {
 }
 
 // ============================================
-// GET FB SENDER NAME (silent fail)
+// GET FB SENDER NAME (silent fail with ID fallback)
 // ============================================
 const senderNameCache = new Map();
 async function getFBSenderName(senderId) {
@@ -236,77 +223,212 @@ async function getFBSenderName(senderId) {
                 timeout: 5000
             }
         );
-        const name = res.data.name || 'Resident';
-        senderNameCache.set(senderId, name);
-        return name;
+        const name = res.data.name || null;
+        if (name) {
+            senderNameCache.set(senderId, name);
+            return name;
+        }
     } catch (err) {
-        senderNameCache.set(senderId, 'Resident');
-        return 'Resident';
+        // Silent fail — Facebook blocks name lookup without advanced permissions
     }
+    // Fallback: unique short ID
+    const shortId = senderId.substring(Math.max(0, senderId.length - 6));
+    const fallback = `Messenger User #${shortId}`;
+    senderNameCache.set(senderId, fallback);
+    return fallback;
 }
 
 // ============================================
-// ROUTE MESSAGE
+// ROUTE MESSAGE — Main conversation state machine
 // ============================================
 async function routeMessage(senderId, senderName, session, text, attachments, savedMsg) {
     const lower = text.toLowerCase().trim();
 
+    // Global commands (always work, regardless of state)
     if (['help', 'tulong', 'menu', 'start'].includes(lower)) {
         return sendFBHelp(senderId, senderName);
     }
     if (['status', 'check', 'update'].includes(lower)) {
         return sendFBStatus(senderId);
     }
+    if (['cancel', 'stop', 'cancel report'].includes(lower)) {
+        await supabase.from('facebook_sessions').update({
+            state: 'idle',
+            partial_data: {}
+        }).eq('fb_sender_id', senderId);
+        return sendFBMessage(senderId, '✅ Kinansela ang report. Type "help" para sa menu.');
+    }
 
+    // ============================================
+    // STATE MACHINE
+    // ============================================
+
+    // IDLE — new message
     if (session.state === 'idle') {
-        if (['hi', 'hello', 'hey', 'kumusta', 'kamusta'].includes(lower)) {
+        // Greeting detection
+        if (['hi', 'hello', 'hey', 'kumusta', 'kamusta', 'good morning', 'good evening'].includes(lower)) {
             return sendFBWelcome(senderId, senderName);
         }
 
+        // Analyze the message
         const analysis = await analyzeReport(text, attachments);
         console.log('🤖 AI Analysis:', JSON.stringify(analysis));
 
-        if (analysis.isNonsense || analysis.confidence < 0.4) {
+        if (analysis.isNonsense || analysis.confidence < 0.35) {
             return sendFBCouldNotUnderstand(senderId);
         }
 
-        if (analysis.priority === 'critical' && analysis.location && analysis.location !== 'Unknown') {
-            return createAndDispatchReport(senderId, senderName, text, analysis, session, savedMsg);
-        }
-
+        // Emergency detected → ask for name
         await supabase.from('facebook_sessions').update({
-            state: 'awaiting_location',
+            state: 'awaiting_name',
             partial_data: {
                 original_text: text,
                 analysis: analysis,
-                attachments: attachments
+                attachments: attachments,
+                detected_at: new Date().toISOString()
             }
         }).eq('fb_sender_id', senderId);
 
-        return sendFBAwaitingLocation(senderId, analysis);
+        return sendFBAskName(senderId, analysis);
     }
 
+    // AWAITING NAME — user should provide their name
+    if (session.state === 'awaiting_name') {
+        const partial = session.partial_data || {};
+        // Save the name they provided
+        const providedName = text.trim().substring(0, 80);
+        if (providedName.length < 2) {
+            return sendFBMessage(senderId, '❓ Pakisulat ang buong pangalan mo para makapag-report kami.');
+        }
+        partial.caller_name = providedName;
+
+        await supabase.from('facebook_sessions').update({
+            state: 'awaiting_location',
+            partial_data: partial
+        }).eq('fb_sender_id', senderId);
+
+        return sendFBAskLocation(senderId, providedName);
+    }
+
+    // AWAITING LOCATION — user should provide location
     if (session.state === 'awaiting_location') {
         const partial = session.partial_data || {};
-        partial.location_text = text;
-        const combinedText = (partial.original_text || '') + ' sa ' + text;
-        const analysis = await analyzeReport(combinedText, partial.attachments || []);
-        return createAndDispatchReport(senderId, senderName, combinedText, analysis, session, savedMsg);
+        const location = text.trim();
+
+        if (location.length < 3) {
+            return sendFBMessage(senderId, '❓ Pakisabi ang eksaktong lokasyon (hal. "may 7-eleven tandang sora").');
+        }
+
+        partial.location_text = location;
+
+        await supabase.from('facebook_sessions').update({
+            state: 'awaiting_details',
+            partial_data: partial
+        }).eq('fb_sender_id', senderId);
+
+        return sendFBAskDetails(senderId, location);
     }
 
+    // AWAITING DETAILS — user should provide extra info (optional)
+    if (session.state === 'awaiting_details') {
+        const partial = session.partial_data || {};
+        partial.additional_details = text.trim();
+
+        // Build final text for AI re-analysis
+        const finalText = [
+            partial.original_text || '',
+            partial.location_text ? `Lokasyon: ${partial.location_text}` : '',
+            partial.additional_details ? `Detalye: ${partial.additional_details}` : ''
+        ].filter(Boolean).join('\n');
+
+        // Re-analyze with all info
+        const analysis = await analyzeReport(finalText, partial.attachments || []);
+
+        return createAndDispatchReport(
+            senderId,
+            partial.caller_name || senderName,
+            finalText,
+            analysis,
+            session,
+            savedMsg,
+            partial
+        );
+    }
+
+    // Default — reset and help
+    await supabase.from('facebook_sessions').update({
+        state: 'idle',
+        partial_data: {}
+    }).eq('fb_sender_id', senderId);
     sendFBHelp(senderId, senderName);
 }
 
 // ============================================
-// AI ANALYSIS — Gemini with model fallback
+// ASK NAME
+// ============================================
+async function sendFBAskName(senderId, analysis) {
+    const emoji = {
+        fire: '🔥', medical: '🚑', accident: '🚗',
+        flood: '🌊', crime: '🚨', other: '⚠️'
+    }[analysis.type] || '⚠️';
+
+    const urgency = analysis.priority === 'critical'
+        ? '🚨 CRITICAL EMERGENCY'
+        : analysis.priority === 'high'
+            ? '🟠 HIGH PRIORITY'
+            : 'ℹ️ Emergency Report';
+
+    await sendFBMessage(
+        senderId,
+        `${emoji} ${urgency} natanggap!
+
+Upang maipadala ko agad ang report sa responders, kailangan ko ng kaunting impormasyon:
+
+1️⃣ **Ano ang pangalan mo?**
+(Isulat lang ang buong pangalan)
+
+Type "cancel" para kanselahin.`
+    );
+}
+
+// ============================================
+// ASK LOCATION
+// ============================================
+async function sendFBAskLocation(senderId, callerName) {
+    await sendFBMessage(
+        senderId,
+        `Salamat, ${callerName}! ✅
+
+2️⃣ **Saan eksakto nangyari ang emergency?**
+(Street, landmark, o building name — hal. "Tandang Sora Ave, tapat ng 7-eleven")
+
+Pwede mo rin i-tap ang 📎 (attachment icon) at i-share ang LIVE LOCATION mo.`
+    );
+}
+
+// ============================================
+// ASK DETAILS (optional)
+// ============================================
+async function sendFBAskDetails(senderId, location) {
+    await sendFBMessage(
+        senderId,
+        `📍 Lokasyon: ${location}
+
+3️⃣ **Karagdagang detalye (opsyonal):**
+Ilang tao ang nasa panganib? Anong klase ng emergency? May nasugatan?
+
+Kung wala na, i-type lang ang "wala" o "none".`
+    );
+}
+
+// ============================================
+// AI ANALYSIS — Gemini with fallback
 // ============================================
 async function analyzeReport(messageText, attachments = []) {
     const modelsToTry = [
         CONFIG.GEMINI_MODEL,
         'gemini-3.6-flash',
-        'gemini-2.5-flash',
-        'gemini-1.5-flash',
-        'gemini-pro'
+        'gemini-2.0-flash-001'
     ].filter(Boolean);
 
     let lastError = null;
@@ -434,117 +556,93 @@ function ruleBasedAnalysis(text, error) {
 }
 
 // ============================================
-// LOCATION RECEIVED
+// LOCATION RECEIVED (shared location attachment)
 // ============================================
 async function handleLocationReceived(senderId, session, coords, savedMsg) {
     const lat = coords.lat;
     const lng = coords.long;
     const partial = session.partial_data || {};
     const originalText = partial.original_text || 'Location shared via Messenger';
+    const callerName = partial.caller_name || session.fb_sender_name || `Messenger User #${senderId.substring(senderId.length - 6)}`;
+
     const analysis = partial.analysis || await analyzeReport(originalText, []);
 
-    analysis.location = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+    const combinedLocation = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+    analysis.location = combinedLocation;
 
-    const { data: incident } = await supabase
-        .from('incident_reports')
-        .insert([{
-            type: analysis.type,
-            title: `[FB] ${analysis.type.toUpperCase()} — Messenger Report`,
-            description: originalText + `\n\n📍 Shared location: ${lat}, ${lng}`,
-            location: JSON.stringify({
-                address: originalText || 'Shared via Messenger',
-                latitude: lat,
-                longitude: lng
-            }),
-            contact_number: 'Messenger',
-            priority: analysis.priority,
-            status: 'reported',
-            barangay: 'Culiat',
-            ai_analysis: { ...analysis, source: 'facebook_messenger', sender_id: senderId }
-        }])
-        .select()
-        .single();
+    // If we were asking for name and got a location instead — still capture location
+    const finalName = callerName;
 
-    const { data: hotline } = await supabase
-        .from('hotline_calls')
-        .insert([{
-            caller_name: session.fb_sender_name || 'Messenger User',
-            caller_contact: `FB:${senderId}`,
-            call_type: 'text',
-            emergency_type: analysis.type,
-            incident_location: `${lat}, ${lng}`,
-            incident_latitude: lat,
-            incident_longitude: lng,
-            description: originalText,
-            priority: analysis.priority,
-            status: 'verified',
-            linked_incident_id: incident?.id,
-            notes: `Auto-parsed from FB Messenger. Confidence: ${analysis.confidence}`
-        }])
-        .select()
-        .single();
-
-    if (savedMsg && hotline) {
-        await supabase.from('facebook_messages')
-            .update({
-                linked_incident_id: incident?.id,
-                linked_hotline_id: hotline.id,
-                parsed_type: analysis.type,
-                parsed_priority: analysis.priority,
-                parsed_location: `${lat}, ${lng}`
-            })
-            .eq('id', savedMsg.id);
-    }
-
-    await supabase.from('facebook_sessions').update({
-        state: 'idle',
-        partial_data: {}
-    }).eq('fb_sender_id', senderId);
-
-    const reply = analysis.priority === 'critical'
-        ? `🚨 Natanggap namin ang emergency report (${analysis.type.toUpperCase()}). AGAD na ipapadala ang responders. Manatiling ligtas.`
-        : `✅ Natanggap namin ang report mo (${analysis.type}). Ive-verify ng aming operator. Salamat!`;
-
-    await sendFBMessage(senderId, reply);
+    return createAndDispatchReport(
+        senderId,
+        finalName,
+        originalText + `\n📍 Location: ${combinedLocation}`,
+        analysis,
+        session,
+        savedMsg,
+        { ...partial, location_text: combinedLocation }
+    );
 }
 
 // ============================================
 // CREATE + DISPATCH REPORT
 // ============================================
-async function createAndDispatchReport(senderId, senderName, fullText, analysis, session, savedMsg) {
+async function createAndDispatchReport(senderId, callerName, fullText, analysis, session, savedMsg, partial) {
+    partial = partial || {};
+
+    // Build final location
+    const finalLocation = partial.location_text || analysis.location || 'Unknown';
+    const additionalDetails = partial.additional_details || '';
+    const callerDisplay = callerName || partial.caller_name || session.fb_sender_name || `Messenger User #${senderId.substring(senderId.length - 6)}`;
+
+    // Compose full description
+    let fullDescription = fullText;
+    if (additionalDetails && !fullText.includes(additionalDetails)) {
+        fullDescription += `\n\n📝 Karagdagang Detalye: ${additionalDetails}`;
+    }
+    fullDescription += `\n\n👤 Reporter: ${callerDisplay}\n📱 Via: Facebook Messenger`;
+
+    // Create incident report
     const { data: incident } = await supabase
         .from('incident_reports')
         .insert([{
             type: analysis.type,
-            title: `[FB] ${analysis.type.toUpperCase()} — ${analysis.location}`,
-            description: fullText,
-            location: JSON.stringify({ address: analysis.location }),
+            title: `[FB] ${analysis.type.toUpperCase()} — ${finalLocation}`,
+            description: fullDescription,
+            location: JSON.stringify({ address: finalLocation }),
             contact_number: `FB:${senderId}`,
             priority: analysis.priority,
             status: 'reported',
             barangay: 'Culiat',
-            ai_analysis: { ...analysis, source: 'facebook_messenger', sender_id: senderId }
+            ai_analysis: {
+                ...analysis,
+                source: 'facebook_messenger',
+                sender_id: senderId,
+                caller_name: callerDisplay
+            }
         }])
         .select()
         .single();
 
+    // Create hotline call record
     const { data: hotline } = await supabase
         .from('hotline_calls')
         .insert([{
-            caller_name: senderName || 'Messenger User',
+            caller_name: callerDisplay,
             caller_contact: `FB:${senderId}`,
             call_type: 'text',
             emergency_type: analysis.type,
-            incident_location: analysis.location,
-            description: fullText,
+            incident_location: finalLocation,
+            description: fullDescription,
             priority: analysis.priority,
             status: 'received',
             linked_incident_id: incident?.id,
-            notes: `Auto-parsed from FB Messenger. Confidence: ${analysis.confidence}`
+            notes: `Via Facebook Messenger. Confidence: ${(analysis.confidence * 100).toFixed(0)}%`
         }])
         .select()
         .single();
 
+    // Link message to records
     if (savedMsg && hotline) {
         await supabase.from('facebook_messages')
             .update({
@@ -552,17 +650,35 @@ async function createAndDispatchReport(senderId, senderName, fullText, analysis,
                 linked_hotline_id: hotline.id,
                 parsed_type: analysis.type,
                 parsed_priority: analysis.priority,
-                parsed_location: analysis.location
+                parsed_location: finalLocation
             })
             .eq('id', savedMsg.id);
     }
 
+    // Reset session
     await supabase.from('facebook_sessions').update({
         state: 'idle',
         partial_data: {}
     }).eq('fb_sender_id', senderId);
 
-    await sendFBMessage(senderId, analysis.suggestedReply);
+    // Reply to user
+    const priorityEmoji = {
+        critical: '🚨', high: '🟠', medium: '🟡', low: '🔵'
+    }[analysis.priority] || '📋';
+
+    const confirmationReply = `${priorityEmoji} **Natanggap na ang report mo, ${callerDisplay.split(' ')[0]}!**
+
+📋 Uri: ${analysis.type.toUpperCase()}
+📍 Lokasyon: ${finalLocation}
+⚠️ Priority: ${analysis.priority.toUpperCase()}
+
+Ang iyong report ay naipadala na sa aming responders. Manatiling kalmado at ligtas. Kung may karagdagang impormasyon, i-type lang dito.
+
+Para sa life-threatening emergency, tumawag din sa **911**.`;
+
+    await sendFBMessage(senderId, confirmationReply);
+
+    console.log(`✅ Report created: ${incident?.id} (${analysis.type}/${analysis.priority}) by ${callerDisplay}`);
 }
 
 // ============================================
@@ -590,30 +706,50 @@ async function sendFBMessage(recipientId, text) {
 }
 
 async function sendFBWelcome(senderId, name) {
-    const text = `👋 Kumusta ${name || ''}! Ako ang Culiat Emergency Bot.
+    const displayName = (name && !name.startsWith('Messenger User')) ? name : 'kaibigan';
 
-Para mag-report ng emergency, i-type lang kung ano ang nangyari. Halimbawa:
+    const text = `👋 Kumusta ${displayName}! Ako ang **Culiat Emergency Bot** — ang inyong katuwang sa emergency.
+
+**Para mag-report ng emergency:**
+I-type lang kung ano ang nangyari. Halimbawa:
 • "may sunog sa tandang sora"
 • "naaksidente yung motor sa congressional"
 • "baha dito sa kanto namin"
 • "may holdap sa 7-eleven"
 
-Pwede rin magpadala ng litrato, video, o location.
+**Pwede rin magpadala ng:**
+📷 Litrato o video
+📍 Live location
 
-Type HELP para sa menu.`;
+Tutulungan kita sa pag-report at padadalhan agad ng responders. 🚨
+
+⚠️ Para sa life-threatening emergency, tumawag din sa **911** o **0962-582-1531**.
+
+Type **HELP** para sa menu.`;
 
     await sendFBMessage(senderId, text);
 }
 
 async function sendFBHelp(senderId, name) {
-    const text = `📞 Culiat Emergency Bot — Menu
+    const text = `📞 **Culiat Emergency Bot — Menu**
 
-• Mag-report: i-type lang ang emergency
-• Mag-attach: pwede magpadala ng litrato, video, o location
-• Status: i-type ang "STATUS"
-• Tumawag: 911 o 0962-582-1531
+**🚨 Mag-report:**
+I-type lang ang emergency (hal. "may sunog sa...")
+Sasagutin ka ng bot at hihingin ang ilang detalye.
 
-⚠️ Para sa life-threatening emergencies, tumawag agad sa 911.`;
+**📷 Mag-attach:**
+Pwede magpadala ng litrato, video, o location
+
+**🔍 Status:**
+I-type ang "STATUS" para makita ang recent reports mo
+
+**❌ Cancel:**
+I-type ang "CANCEL" para kanselahin ang kasalukuyang report
+
+**📞 Tumawag:**
+911 o 0962-582-1531 (para sa urgent)
+
+⚠️ Para sa life-threatening emergencies, tumawag agad sa **911**.`;
 
     await sendFBMessage(senderId, text);
 }
@@ -623,29 +759,15 @@ async function sendFBCouldNotUnderstand(senderId) {
         senderId,
         `🤔 Hindi ko maintindihan ang mensahe mo.
 
-Subukan ulit:
+**Subukan ulit:**
 • Ilarawan ang emergency (hal. "may sunog sa...")
 • Isama ang lokasyon
 • Pwede magpadala ng litrato o location
 
-Para sa urgent, tumawag sa 911.`
-    );
-}
+**Halimbawa:**
+"May aksidente sa tandang sora, may nasugatan"
 
-async function sendFBAwaitingLocation(senderId, analysis) {
-    const emoji = {
-        fire: '🔥', medical: '🚑', accident: '🚗',
-        flood: '🌊', crime: '🚨', other: '⚠️'
-    }[analysis.type] || '⚠️';
-
-    await sendFBMessage(
-        senderId,
-        `${emoji} Natanggap ko ang ulat mo na ${analysis.type}.
-
-📍 SAAN ito nangyari?
-Pakisagot ang lokasyon (street, landmark, o building).
-
-Pwede mo ring i-tap ang 📎 (attachment icon) sa Messenger at i-share ang LIVE LOCATION para mas mabilis ang response.`
+Para sa urgent, tumawag sa **911**.`
     );
 }
 
@@ -664,10 +786,11 @@ async function sendFBStatus(senderId) {
 
         const text = recent.map(r => {
             const emoji = { critical: '🔴', high: '🟠', medium: '🟡', low: '🔵' }[r.priority] || '⚪';
-            return `${emoji} ${r.emergency_type.toUpperCase()} — ${r.status.replace('_', ' ')}\nID: ${r.id.substring(0, 8)}`;
+            const date = new Date(r.created_at).toLocaleString('en-PH', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+            return `${emoji} **${r.emergency_type.toUpperCase()}** — ${r.status.replace('_', ' ')}\n   ID: ${r.id.substring(0, 8)} · ${date}`;
         }).join('\n\n');
 
-        await sendFBMessage(senderId, `📋 Recent Reports:\n\n${text}`);
+        await sendFBMessage(senderId, `📋 **Recent Reports:**\n\n${text}`);
     } catch (err) {
         await sendFBMessage(senderId, '⚠️ Hindi ma-check status ngayon.');
     }
