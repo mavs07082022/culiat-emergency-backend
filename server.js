@@ -1,6 +1,6 @@
 // ============================================
 // Barangay Culiat — Facebook Messenger Emergency Backend
-// v6 — Writes to emergencies + hotline_calls + incident_reports
+// v7 — Type mapping for emergencies table + triple-write
 // ============================================
 
 const express = require('express');
@@ -29,6 +29,24 @@ const CONFIG = {
 
 const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_SERVICE_KEY);
 const genAI = new GoogleGenerativeAI(CONFIG.GEMINI_API_KEY);
+
+// ============================================
+// TYPE MAPPING — bot types → emergencies schema types
+// ============================================
+const EMERGENCY_TYPE_MAP = {
+    'fire': 'fire',
+    'flood': 'flood',
+    'crime': 'armed_conflict',           // bot says "crime" → schema says "armed_conflict"
+    'medical': 'medical',
+    'accident': 'accident',
+    'other': 'other',
+    'natural_disaster': 'natural_disaster',
+    'armed_conflict': 'armed_conflict'
+};
+
+function mapEmergencyType(botType) {
+    return EMERGENCY_TYPE_MAP[botType] || 'other';
+}
 
 // ============================================
 // HEALTH CHECK
@@ -287,14 +305,14 @@ function ruleBasedAnalysis(text, error) {
         medical: ['sugat', 'sakit', 'ospital', 'hindi humihinga', 'atake'],
         accident: ['aksidente', 'bangga', 'nasagasaan', 'accident'],
         flood: ['baha', 'pagbaha', 'flood'],
-        crime: ['holdap', 'nakaw', 'saksak', 'baril', 'crime']
+        crime: ['holdap', 'nakaw', 'saksak', 'baril', 'crime', 'putukan', 'gun']
     };
     let detectedType = 'other', matchCount = 0;
     for (const [type, words] of Object.entries(keywords)) {
         const m = words.filter(w => lower.includes(w)).length;
         if (m > matchCount) { matchCount = m; detectedType = type; }
     }
-    const isCritical = ['patay', 'walang malay', 'hindi humihinga', 'sumabog', 'saksak'].some(w => lower.includes(w));
+    const isCritical = ['patay', 'walang malay', 'hindi humihinga', 'sumabog', 'saksak', 'putukan', 'baril'].some(w => lower.includes(w));
     return {
         type: detectedType,
         priority: isCritical ? 'critical' : (matchCount > 0 ? 'medium' : 'low'),
@@ -331,22 +349,23 @@ async function createAndDispatchReport(senderId, callerName, fullText, analysis,
     partial = partial || {};
     const finalLocation = partial.location_text || analysis.location || 'Unknown';
     const callerDisplay = callerName || partial.caller_name || session.fb_sender_name || `Messenger User #${senderId.slice(-6)}`;
+    const emergencyTypeForSchema = mapEmergencyType(analysis.type);
 
     let fullDescription = fullText;
     if (partial.additional_details) fullDescription += `\n\n📝 Detalye: ${partial.additional_details}`;
     fullDescription += `\n\n👤 Reporter: ${callerDisplay}\n📱 Via: Facebook Messenger`;
 
-    console.log(`📝 Creating records for: ${analysis.type}/${analysis.priority} at ${finalLocation}`);
+    console.log(`📝 Creating records: botType=${analysis.type} → schemaType=${emergencyTypeForSchema} | priority=${analysis.priority} | location=${finalLocation}`);
 
     // ============================================
-    // 1. Create EMERGENCY record (main incident table)
+    // 1. Create EMERGENCY record (uses mapped type)
     // ============================================
     let emergencyId = null;
     try {
         const { data: emergency, error: emErr } = await supabase
             .from('emergencies')
             .insert([{
-                type: analysis.type,
+                type: emergencyTypeForSchema,       // ← MAPPED TYPE
                 priority: analysis.priority,
                 status: 'reported',
                 title: `[FB] ${analysis.type.toUpperCase()} — ${finalLocation}`,
@@ -356,7 +375,11 @@ async function createAndDispatchReport(senderId, callerName, fullText, analysis,
                 reporter_phone: `FB:${senderId}`,
                 source: 'hotline',
                 verified_status: 'pending',
-                ai_classification: { ...analysis, sender_id: senderId }
+                ai_classification: {
+                    ...analysis,
+                    sender_id: senderId,
+                    original_bot_type: analysis.type
+                }
             }])
             .select()
             .single();
@@ -372,7 +395,7 @@ async function createAndDispatchReport(senderId, callerName, fullText, analysis,
     }
 
     // ============================================
-    // 2. Create HOTLINE_CALL record (hotline module)
+    // 2. Create HOTLINE_CALL record
     // ============================================
     let hotlineId = null;
     try {
@@ -382,7 +405,7 @@ async function createAndDispatchReport(senderId, callerName, fullText, analysis,
                 caller_number: `FB:${senderId}`,
                 caller_name: callerDisplay,
                 description: fullDescription,
-                emergency_type: analysis.type,
+                emergency_type: analysis.type,       // ← original bot type (hotline_calls has no strict check)
                 priority: analysis.priority,
                 status: 'pending',
                 call_type: 'facebook',
@@ -404,14 +427,13 @@ async function createAndDispatchReport(senderId, callerName, fullText, analysis,
     }
 
     // ============================================
-    // 3. ALSO create INCIDENT_REPORTS record
-    //    (so existing responder dashboard shows it)
+    // 3. Create INCIDENT_REPORTS record (responder dashboard)
     // ============================================
     try {
         const { data: incident, error: incErr } = await supabase
             .from('incident_reports')
             .insert([{
-                type: analysis.type,
+                type: analysis.type,             // ← incident_reports accepts 'crime'
                 title: `[FB] ${analysis.type.toUpperCase()} — ${finalLocation}`,
                 description: fullDescription,
                 location: JSON.stringify({ address: finalLocation }),
