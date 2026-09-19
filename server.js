@@ -1,6 +1,6 @@
 // ============================================
 // Barangay Culiat — Facebook Messenger Emergency Backend
-// v2 — Gemini 3.6 + Location Fix
+// v3 — Raw Body Signature Fix + Gemini 3.6
 // ============================================
 
 const express = require('express');
@@ -10,7 +10,18 @@ const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+
+// ============================================
+// MIDDLEWARE — Capture RAW body for signature verification
+// ============================================
+app.use(express.json({
+    limit: '10mb',
+    verify: (req, res, buf) => {
+        // Save the raw buffer BEFORE JSON parsing
+        // This is what Facebook actually signs
+        req.rawBody = buf;
+    }
+}));
 app.use(express.urlencoded({ extended: false, limit: '10mb' }));
 
 // ============================================
@@ -24,10 +35,10 @@ const CONFIG = {
     FB_VERIFY_TOKEN: process.env.FB_VERIFY_TOKEN || 'culiat_ecs_verify_2026',
     FB_APP_SECRET: process.env.FB_APP_SECRET,
     GEMINI_MODEL: process.env.GEMINI_MODEL || 'gemini-3.6-flash',
+    BYPASS_SIGNATURE: process.env.BYPASS_SIGNATURE === 'true',
 };
 
-// Validate config
-const missing = Object.keys(CONFIG).filter(k => !CONFIG[k]);
+const missing = Object.keys(CONFIG).filter(k => !CONFIG[k] && k !== 'BYPASS_SIGNATURE');
 if (missing.length > 0) {
     console.error('❌ Missing environment variables:', missing.join(', '));
 }
@@ -56,9 +67,10 @@ app.get('/', (req, res) => {
             <ul>
                 <li>Supabase: ${CONFIG.SUPABASE_URL ? '✅' : '❌'}</li>
                 <li>Gemini: ${CONFIG.GEMINI_API_KEY ? '✅' : '❌'}</li>
+                <li>Gemini Model: <code>${CONFIG.GEMINI_MODEL}</code></li>
                 <li>FB Token: ${CONFIG.FB_PAGE_ACCESS_TOKEN ? '✅' : '❌'}</li>
                 <li>FB Secret: ${CONFIG.FB_APP_SECRET ? '✅' : '❌'}</li>
-                <li>Gemini Model: <code>${CONFIG.GEMINI_MODEL}</code></li>
+                <li>Signature Check: ${CONFIG.BYPASS_SIGNATURE ? '⚠️ BYPASSED' : '🔒 Enabled'}</li>
             </ul>
         </body>
         </html>
@@ -87,10 +99,12 @@ app.get('/webhook/facebook', (req, res) => {
 // FACEBOOK WEBHOOK — Message Events (POST)
 // ============================================
 app.post('/webhook/facebook', async (req, res) => {
-    const signature = req.headers['x-hub-signature-256'];
-    if (CONFIG.FB_APP_SECRET && !verifyFBSignature(req.body, signature)) {
-        console.warn('⚠️ Invalid FB signature — rejecting');
-        return res.sendStatus(403);
+    // Signature verification using RAW body
+    if (!CONFIG.BYPASS_SIGNATURE && CONFIG.FB_APP_SECRET) {
+        if (!verifyFBSignature(req)) {
+            console.warn('⚠️ Invalid FB signature — rejecting');
+            return res.sendStatus(403);
+        }
     }
 
     res.status(200).send('EVENT_RECEIVED');
@@ -111,18 +125,32 @@ app.post('/webhook/facebook', async (req, res) => {
     }
 });
 
-function verifyFBSignature(body, signature) {
-    if (!signature) return false;
+// ============================================
+// VERIFY SIGNATURE — Uses RAW body bytes
+// ============================================
+function verifyFBSignature(req) {
+    const signature = req.headers['x-hub-signature-256'];
+    if (!signature) {
+        console.warn('⚠️ No x-hub-signature-256 header');
+        return false;
+    }
+    if (!req.rawBody) {
+        console.warn('⚠️ No raw body captured');
+        return false;
+    }
+
     const expected = 'sha256=' + crypto
         .createHmac('sha256', CONFIG.FB_APP_SECRET)
-        .update(JSON.stringify(body))
+        .update(req.rawBody)   // ← USE RAW BUFFER
         .digest('hex');
+
     try {
         return crypto.timingSafeEqual(
             Buffer.from(signature),
             Buffer.from(expected)
         );
-    } catch {
+    } catch (err) {
+        console.warn('Signature comparison error:', err.message);
         return false;
     }
 }
@@ -192,7 +220,7 @@ async function handleFBMessage(event) {
 }
 
 // ============================================
-// GET FB SENDER NAME (cached, silent fail)
+// GET FB SENDER NAME (silent fail)
 // ============================================
 const senderNameCache = new Map();
 async function getFBSenderName(senderId) {
@@ -203,16 +231,15 @@ async function getFBSenderName(senderId) {
             {
                 params: {
                     access_token: CONFIG.FB_PAGE_ACCESS_TOKEN,
-                    fields: 'first_name,last_name'
+                    fields: 'name'
                 },
                 timeout: 5000
             }
         );
-        const name = `${res.data.first_name || ''} ${res.data.last_name || ''}`.trim() || 'Resident';
+        const name = res.data.name || 'Resident';
         senderNameCache.set(senderId, name);
         return name;
     } catch (err) {
-        // Silent fail — non-critical. Default to "Resident"
         senderNameCache.set(senderId, 'Resident');
         return 'Resident';
     }
@@ -274,7 +301,6 @@ async function routeMessage(senderId, senderName, session, text, attachments, sa
 // AI ANALYSIS — Gemini with model fallback
 // ============================================
 async function analyzeReport(messageText, attachments = []) {
-    // Try configured model first, then fall back to alternatives
     const modelsToTry = [
         CONFIG.GEMINI_MODEL,
         'gemini-3.6-flash',
@@ -361,13 +387,12 @@ Return ONLY this JSON (no markdown):
         }
     }
 
-    // All models failed — use rule-based fallback
     console.error('❌ All Gemini models failed, using rule-based fallback');
     return ruleBasedAnalysis(messageText, lastError);
 }
 
 // ============================================
-// RULE-BASED FALLBACK (when Gemini is down)
+// RULE-BASED FALLBACK
 // ============================================
 function ruleBasedAnalysis(text, error) {
     const lower = (text || '').toLowerCase();
@@ -613,7 +638,6 @@ async function sendFBAwaitingLocation(senderId, analysis) {
         flood: '🌊', crime: '🚨', other: '⚠️'
     }[analysis.type] || '⚠️';
 
-    // NOTE: Quick replies with location removed — deprecated by FB API v4+
     await sendFBMessage(
         senderId,
         `${emoji} Natanggap ko ang ulat mo na ${analysis.type}.
@@ -676,5 +700,6 @@ app.listen(PORT, () => {
     console.log('  Gemini Model:', CONFIG.GEMINI_MODEL);
     console.log('  FB Token:', CONFIG.FB_PAGE_ACCESS_TOKEN ? '✅' : '❌');
     console.log('  FB Secret:', CONFIG.FB_APP_SECRET ? '✅' : '❌');
+    console.log('  Signature Check:', CONFIG.BYPASS_SIGNATURE ? '⚠️ BYPASSED' : '🔒 Enabled');
     console.log('========================================');
 });
